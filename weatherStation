@@ -1,0 +1,452 @@
+
+
+/* This is the sketch for Tim's weather station. It has: an indoor and outdoor temp/humidity sensor. It also rocks a barametric pressure sensor
+  and a light sensor. It then reads out the inforamtion onto a small TFT screen 
+  Last updated 6/6/19 - moved hours counter to days*/
+
+#include <Adafruit_GFX.h>    // Core graphics library
+#include <Adafruit_ILI9341.h> // Hardware-specific library
+#include <SPI.h>
+#include <Adafruit_BMP183.h> //Barametric Pressure Sensor
+#include <Adafruit_Sensor.h> // General sensor library
+#include <DHT.h> // Indoor Temp & humidity
+#include <Wire.h>
+#include <SHT1x.h> //Outdoor Temp & Humidity
+#include <assert.h> //Assertion when true
+
+
+
+//Define the time window size for the pressure delta
+#define WINDOW 4
+
+// For the Adafruit TFT Screen shield, these are the default.
+#define TFT_DC 9
+#define TFT_CS 10
+
+// For the pressure sensor.
+#define BMP183_CLK  8  // Clock Sensor
+#define BMP183_SDO  7  // AKA MISO
+#define BMP183_SDI  6  // AKA MOSI
+#define BMP183_CS   5 // Chip-select pin
+
+// DHT (indoor) sensor pins
+#define DHTPIN 4
+#define DHTTYPE DHT22
+
+//outdoor sensor instance
+#define clockPin 2
+#define dataPin 9
+
+enum pressure_change_t { SLOW_FALL, FAST_FALL, SLOW_RISE, FAST_RISE, STEADY };
+
+// DHT (indoor) sensor instance
+DHT dht(DHTPIN, DHTTYPE);
+
+
+//Initialize outdoor sensor
+SHT1x sht1x(dataPin, clockPin);
+
+//initialize software SPI and use 4 pins below
+Adafruit_BMP183 bmp = Adafruit_BMP183(BMP183_CLK, BMP183_SDO, BMP183_SDI, BMP183_CS);
+
+// Set the LED on pin 3
+int led = 3;
+
+// Use hardware SPI (on Uno, #13, #12, #11) and the above for CS/DC
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
+
+//Variables for Sensors
+int lightLevel;
+int counter;
+float coldCounter;
+float hotCounter;
+float humidity;
+float temperature;
+float amHum;
+float amTemp;
+long pressure;
+float mostCold;
+float mostHot;
+long pressureReadings[WINDOW];
+size_t countPressureReadings;
+unsigned long nextPressureReadingTime;
+String weather;
+String pressChanges;
+
+
+//Function creation for min pressure and max pressure
+size_t minElement(const long* pArray, size_t lenArray) {
+  assert(pArray && 0 < lenArray);
+  size_t indexOfMin = 0;
+  for (size_t i = 1; i < lenArray; ++i) {
+    indexOfMin = pArray[i] < pArray[indexOfMin] ? i : indexOfMin;
+  }
+  return indexOfMin;
+}
+
+size_t maxElement(const long* pArray, size_t lenArray) {
+  assert(pArray && 0 < lenArray);
+  size_t indexOfMax = 0;
+  for (size_t i = 1; i < lenArray; ++i) {
+    indexOfMax = pArray[i] > pArray[indexOfMax] ? i : indexOfMax;
+  }
+  return indexOfMax;
+}
+
+// Function for the delta of pressure
+void deltas(long* pOut, const long* pIn, size_t lenArray) {
+  assert(pOut && pIn && 0 < lenArray);
+  *pOut = 0;
+  for (size_t i = 1; i < lenArray; ++i) {
+    pOut[i] = pIn[i] - pIn[i - 1];
+  }
+}
+
+// Function for rotating the values of the pressure array with time
+void rotate(long* pArray, size_t lenArray) {
+  assert(pArray && 0 < lenArray);
+  long temp = *pArray;
+  memmove(pArray, pArray + 1, (lenArray - 1) * sizeof(long));
+  pArray[lenArray - 1] = temp;
+}
+
+float rateOfPressureChange(long* pArray, size_t lenArray) {
+  assert(pArray && 0 < lenArray);
+  size_t minEle = minElement(pArray, lenArray);
+  size_t maxEle = maxElement(pArray, lenArray);
+  size_t current = pArray[lenArray - 1];
+  if (current - pArray[minEle] < pArray[maxEle] - current) { // trend is rising
+
+  }
+  else if (pArray[maxEle] - current < current - pArray[minEle]) { // trend is falling
+
+  }
+  else if (minEle < maxEle) { // trend is rising
+
+  }
+  else if (maxEle < minEle) { // trend is falling
+
+  }
+  else { // steady
+
+  }
+}
+
+void setup() {
+  // for debugging, wait until a serial console is connected
+  Serial.begin(9600);
+  delay(1000);
+  // (!Serial); // Waits for serial to start before starting the sketch
+
+  // initialize the digital pin as output
+  pinMode(led, OUTPUT);
+
+  // start TFT screen and set rotation
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+
+  // get time to display "sensor up time"
+  unsigned long time = millis();
+  tft.fillScreen(ILI9341_BLACK);
+
+  
+  /* Initialise the pressure sensor */
+   bmp.begin();
+  if (! bmp.begin()) {
+    /* There was a problem detecting the BMP183 ... check your connections */
+    Serial.print("Air Pressure Sensor not found ... Check your wiring!");
+  }
+  //Set the count of readings to 0
+  countPressureReadings = 0;
+  nextPressureReadingTime = 0;
+
+
+  //checks to see if Indoor are valid.
+  dht.begin();
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("Failed to read from Indoor DHT Sensor!");
+  }
+
+  //Sets the mostCold & mostHot Veriable high so the math works
+  mostCold = 200;
+  mostHot = 0;
+  
+}
+
+pressure_change_t classifyPressureChange(long change) {
+  return change < -1.6                 ? FAST_FALL :
+         -1 <= change && change < -.67 ? SLOW_FALL :
+         -.66 <= change && change < 0  ? STEADY    :
+         .67  <= change && change < 1 ? SLOW_RISE :
+         /* otherwise */                FAST_RISE;
+}
+
+constexpr uint32_t combineChanges(pressure_change_t c1, pressure_change_t c2,
+                                  pressure_change_t c3, pressure_change_t c4)
+{
+  return c1 << 12 | c2 << 8 | c3 << 4 | c4;
+}
+
+uint32_t combineChangesArray(const pressure_change_t* pArray, size_t lenArray) {
+  assert(pArray && 0 < lenArray && lenArray <= 8);
+  uint32_t result = *pArray;
+  for (size_t i = 1; i < lenArray; ++i) {
+    result = (result << 4) | pArray[i];
+  }
+  pressChanges = result;
+  return result;
+  
+}
+
+
+//TODO work in the current pressure and the rate of change to make the 'prediction'
+//const char* prediction(const pressure_change_t* changes, size_t lenArray) {
+//  assert(changes && 0 < lenArray);
+//  switch (combineChangesArray(changes, lenArray)) {
+//    case combineChanges(SLOW_RISE, FAST_RISE, FAST_RISE, FAST_RISE): return "Oh noes!";
+//    case combineChanges(FAST_RISE, SLOW_RISE, FAST_RISE, FAST_RISE): return "Oh noes!";
+//    case combineChanges(FAST_RISE, FAST_RISE, SLOW_FALL, FAST_RISE): return "Oh noes!";
+//    case combineChanges(FAST_RISE, FAST_RISE, FAST_RISE, SLOW_RISE): return "Oh noes!";
+//    //    case combineChanges(FAST_RISE, FAST_RISE, FAST_RISE, FAST_RISE): return "Oh noes!";
+//    //    case combineChanges(FAST_RISE, FAST_RISE, FAST_RISE, FAST_RISE): return "Oh noes!";
+//
+//    default                                                        : return "steady";
+//  }
+//}
+
+void loop()
+{
+  Serial.print("pressChanges:");
+  Serial.println(pressChanges);
+  Serial.print(sht1x.readTemperatureF());
+  
+ float now = millis();
+
+  //Measure the data form am sensor (outdoor)
+  float amHum = sht1x.readHumidity();
+  float amTemp = sht1x.readTemperatureF();
+  if (isnan(amTemp)) {
+    float amTemp = sht1x.readTemperatureF();  
+  }
+
+  // Measure the data from DHT (indoor)
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+
+  //Measure the light level,
+  int lightLevel = analogRead(A0);
+
+  // Save coldest recorded temp and tell how many hours ago it was
+  if (amTemp <= mostCold) {
+    mostCold = amTemp;
+    coldCounter = 0;
+  }
+  else {
+    coldCounter ++;
+  }
+  
+  //Save hottest recorded temp with hour counter
+  if (amTemp > mostHot) {
+    mostHot = amTemp;
+    hotCounter = 0;
+  }
+  else {
+    hotCounter ++;
+  }
+
+  //Record the past pressure for weather calculations
+  //Measure pressure
+  long pressure = bmp.getPressure() / 100;
+  const char* msg = NULL;
+  if (counter == 0 || nextPressureReadingTime <= now) {
+    if (countPressureReadings < WINDOW) {
+      pressureReadings[countPressureReadings] = pressure;
+    }
+    else {
+      rotate(pressureReadings, WINDOW);
+      pressureReadings[WINDOW - 1] = pressure;
+      long changes[WINDOW];
+      deltas(changes, pressureReadings, WINDOW);
+      pressure_change_t pc[WINDOW];
+      for (size_t i = 0; i < WINDOW; ++i) {
+        pc[i] = classifyPressureChange(changes[i]);
+      }
+   //   msg = prediction(pc, WINDOW);
+      Serial.print(msg);
+    }
+    ++countPressureReadings;
+    nextPressureReadingTime += 3600000;
+  }
+
+
+  //Use the current pressure to predict weather
+  if (pressure <= 984) {
+    weather = "Stormin' Norman";
+  }
+  else if
+  (pressure > 984 && pressure <= 1000) {
+    weather = "Rainy Day";
+  }
+  else if
+  (pressure > 1000 && pressure <= 1009) {
+    weather = "Weather Changin";
+  }
+  else if
+  (pressure > 1009 && pressure <= 1022) {
+    weather = "It's a Fair Day";
+  }
+  else if
+  (pressure > 1022) {
+    weather = "Clear and Dry";
+  }
+  else
+  { weather = "No News";
+  }
+
+  //// Debug Calcualtions to Serial
+  Serial.println(mostCold);
+  Serial.println(coldCounter);
+  Serial.println(mostHot);
+  Serial.println(hotCounter);
+
+  // Serial Print Measurements
+  Serial.print(pressure);
+  Serial.println(" millibar (hPa)");
+  Serial.print("Indoor Temperature: ");
+  Serial.print(1.8 * temperature + 32.0, 2); //Convert to Ferignheit
+  Serial.println(" *F");
+  Serial.print("Indoor Humidity: ");
+  Serial.println(humidity);
+  Serial.print("Indoor Light Level: ");
+  Serial.println(lightLevel);
+  Serial.println("");
+  Serial.print("Outdoor Temp: ");
+  Serial.print(amTemp);
+  Serial.println(" *F");
+  Serial.println("Outdoor Humidity: ");
+  Serial.println(amHum);
+
+  // Writing to the TFT screen
+  // Draw sketch running time
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(0, 10);
+  tft.print("Sketch");
+  tft.setCursor(0, 30);
+  tft.print("Running: ");
+  tft.setCursor(110, 10);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_BLUE);
+  tft.print(now / 1000 / 60 / 60 / 24, 1); //calculate sketch running time into days
+  if (msg) { tft.print(msg); }
+  tft.setTextSize(1);
+  tft.setCursor(110, 30);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print("Days");
+
+  // Draw Indoor Temp/Hum sensors
+  tft.setTextSize(2);
+  tft.setCursor(0, 127);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print("In Tmp (F):");
+  tft.setTextSize(3);
+  tft.setTextColor(ILI9341_GREEN);
+  tft.println(1.8 * temperature + 32.0, 1); //Convert to Ferignheit
+
+  tft.setCursor(0, 155);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print("In Hum (%):");
+  tft.setTextColor(ILI9341_RED);
+  tft.setTextSize(3);
+  tft.println(humidity, 1);
+
+  //Draw Outdoor Temp/Hum
+  tft.setCursor(0, 190);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.print("Out Tmp (F):");
+  tft.setTextColor(ILI9341_GREEN);
+  tft.setTextSize(3);
+  tft.println(amTemp, 1); //Convert to Ferghin
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setCursor(0, 218);
+  tft.print("Out Hum (%):");
+  tft.setTextSize(3);
+  tft.setTextColor(ILI9341_RED);
+  tft.println(amHum, 1);
+  tft.setTextSize(2);
+  tft.println(" ");
+
+  //Draw Pressure Readings
+  tft.setTextColor(ILI9341_CYAN);
+  tft.setCursor(160, 10);
+  tft.print("Pressure Now:");
+  tft.setCursor(170, 30);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.print(pressure);
+  tft.println(" (Mbar)");
+  
+  //Draw Weather prediction based on current pressure:
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(0, 55);
+  tft.print("Prediction:");
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.println(weather);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(0, 75);
+  tft.print("Pressure");
+  tft.setCursor(0, 95);
+  tft.print("Trend:");
+  tft.setCursor(105, 85);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.println("Trend Goes Here");
+
+  //Draw Most Cold Readings;
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(225, 127);
+  tft.setTextSize(1);
+  tft.print("Coldest Outdoor");
+  tft.setCursor(245, 137);
+  tft.print("(F):");
+  tft.print(mostCold, 1);
+  tft.setCursor(235, 147);
+  tft.print("Days Ago:");
+  tft.println(coldCounter / 60 / 24, 1);
+
+  //Draw Most Hot Readings:
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(225, 167);
+  tft.print("Hottest Outdoor");
+  tft.setCursor(245, 177);
+  tft.print("(F):");
+  tft.print(mostHot, 1);
+  tft.setCursor(235, 187);
+  tft.print("Days Ago:");
+  tft.println(hotCounter / 60 / 24, 1);
+
+  //Draw Light Readings
+  tft.setCursor(225, 207);
+  tft.println("Light Intensity");
+  tft.setCursor(265, 217);
+  tft.println(lightLevel, 1);
+
+  // Draw Lines
+  tft.drawLine(0, 50, tft.width() - 1, 50, ILI9341_MAGENTA);
+  tft.drawLine(0, 115, tft.width() - 1, 115, ILI9341_MAGENTA);
+  tft.drawLine(220, 115, 220, 250, ILI9341_MAGENTA);
+
+
+
+  // Turn on the LED if the indoor temp is greater than outdoor temp, i.e. Is is colder outside than inside?.
+  digitalWrite(led, temperature > amTemp ? HIGH : LOW);
+
+
+  // Leave the measurements on the screen for 1 minute then reload it all.
+  delay(60000);
+  tft.fillScreen(ILI9341_BLACK);
+  counter ++;
+
+}
